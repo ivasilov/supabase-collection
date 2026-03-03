@@ -1,5 +1,6 @@
 import { queryCollectionOptions } from "@tanstack/query-db-collection";
-import { createCollection, extractSimpleComparisons, parseLoadSubsetOptions, parseOrderByExpression, parseWhereExpression } from "@tanstack/react-db";
+import { extractSimpleComparisons, parseLoadSubsetOptions, parseOrderByExpression, parseWhereExpression } from "@tanstack/react-db";
+import { QueryClient, isServer } from "@tanstack/query-core";
 
 //#region src/functions.ts
 const buildQuery = (baseQuery, filter) => {
@@ -99,9 +100,56 @@ const supabaseOnDelete = async (supabase, tableName, filter, { transaction, coll
 };
 
 //#endregion
+//#region src/query-client.ts
+function makeQueryClient() {
+	return new QueryClient({ defaultOptions: { queries: { staleTime: 60 * 1e3 } } });
+}
+let browserQueryClient = void 0;
+function getQueryClient() {
+	if (isServer) return makeQueryClient();
+	else {
+		if (!browserQueryClient) browserQueryClient = makeQueryClient();
+		return browserQueryClient;
+	}
+}
+
+//#endregion
 //#region src/db.ts
-const supabaseCollectionOptions = ({ tableName, getKey, where, schema, queryClient, supabase }) => {
-	return queryCollectionOptions({
+const queryClientRegistries = /* @__PURE__ */ new Map();
+const ensureQueryCacheSubscription = (queryClient) => {
+	if (queryClientRegistries.has(queryClient)) return;
+	const tables = /* @__PURE__ */ new Map();
+	queryClientRegistries.set(queryClient, tables);
+	queryClient.getQueryCache().subscribe((args) => {
+		if (args.type !== "observerAdded" && args.type !== "observerRemoved") return;
+		for (const [tableName, entry] of tables) {
+			const queries = queryClient.getQueryCache().findAll({
+				queryKey: [tableName],
+				type: "active"
+			});
+			if (queries.length > 0 && !entry.realtimeChannel && entry.collectionRef) entry.realtimeChannel = attachSupabaseListeners(entry.supabase, tableName, entry.collectionRef);
+			else if (queries.length === 0 && entry.realtimeChannel) {
+				entry.supabase.removeChannel(entry.realtimeChannel);
+				entry.realtimeChannel = null;
+			}
+		}
+	});
+};
+const registerTable = (queryClient, tableName, supabase) => {
+	ensureQueryCacheSubscription(queryClient);
+	const tables = queryClientRegistries.get(queryClient);
+	if (!tables.has(tableName)) tables.set(tableName, {
+		supabase,
+		collectionRef: null,
+		realtimeChannel: null
+	});
+	return tables.get(tableName);
+};
+const supabaseCollectionOptions = ({ tableName, getKey, where, schema, queryClient, supabase, realtime }) => {
+	queryClient = queryClient ?? getQueryClient();
+	let entry = null;
+	if (realtime) entry = registerTable(queryClient, tableName, supabase);
+	const config = queryCollectionOptions({
 		queryClient,
 		getKey,
 		schema,
@@ -112,9 +160,22 @@ const supabaseCollectionOptions = ({ tableName, getKey, where, schema, queryClie
 		onUpdate: (ctx) => supabaseOnUpdate(supabase, tableName, where, ctx),
 		onDelete: (ctx) => supabaseOnDelete(supabase, tableName, where, ctx)
 	});
+	const originalSync = config.sync.sync;
+	return {
+		...config,
+		sync: { sync: (...args) => {
+			if (entry) entry.collectionRef = args[0].collection;
+			return originalSync(...args);
+		} }
+	};
 };
 const attachSupabaseListeners = (supabase, tableName, collection) => {
-	supabase.channel(tableName).on("postgres_changes", {
+	if (!supabase.channel) {
+		console.log("Server supabase doesn't have a channel");
+		return null;
+	}
+	const channel = supabase.channel(tableName);
+	channel.on("postgres_changes", {
 		event: "*",
 		schema: "public",
 		table: tableName
@@ -126,19 +187,8 @@ const attachSupabaseListeners = (supabase, tableName, collection) => {
 			if (collection.has(id)) collection.utils.writeDelete(id);
 		}
 	}).subscribe();
-};
-const createSupabaseCollection = ({ tableName, getKey, where, schema, queryClient, supabase }) => {
-	const collection = createCollection(supabaseCollectionOptions({
-		tableName,
-		getKey,
-		where,
-		schema,
-		queryClient,
-		supabase
-	}));
-	attachSupabaseListeners(supabase, tableName, collection);
-	return collection;
+	return channel;
 };
 
 //#endregion
-export { createSupabaseCollection };
+export { supabaseCollectionOptions };
